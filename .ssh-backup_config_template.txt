@@ -1,0 +1,5 @@
+# Add your backup targets here, one per line.
+# Format: user@host:/remote/path/to/folder
+# Example:
+# admin@192.168.1.10:/var/www/html
+# deploy@server2.local:/opt/app/data
