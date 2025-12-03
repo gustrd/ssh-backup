@@ -2,22 +2,81 @@ import os
 import sys
 import subprocess
 import tarfile
-import io
 import shlex
+import tempfile
+import shutil
+import traceback
 
 CONFIG_FILE = ".ssh-backup_config.txt"
 BACKUP_DIR = "ssh-backups"
 
+def validate_target(target, line_num):
+    """Validate a backup target entry. Returns (is_valid, error_message)."""
+    if not target:
+        return False, "empty target"
+
+    # Must contain exactly one colon separating host from path
+    if ':' not in target:
+        return False, "missing ':' separator (expected format: [user@]host:/path)"
+
+    parts = target.split(':', 1)
+    if len(parts) != 2:
+        return False, "invalid format (expected format: [user@]host:/path)"
+
+    remote_part, path = parts
+
+    # Validate remote part (host or user@host)
+    if not remote_part:
+        return False, "missing host"
+
+    if '@' in remote_part:
+        user, host = remote_part.split('@', 1)
+        if not user:
+            return False, "empty username before '@'"
+        if not host:
+            return False, "empty hostname after '@'"
+
+    # Validate path
+    if not path:
+        return False, "missing remote path"
+
+    if not path.startswith('/'):
+        return False, f"path should be absolute (starts with '/'), got: {path}"
+
+    return True, None
+
 def parse_config():
+    """Parse and validate the configuration file."""
     if not os.path.exists(CONFIG_FILE):
         print(f"Error: Config file '{CONFIG_FILE}' not found.")
         sys.exit(1)
+
     targets = []
+    errors = []
+    line_num = 0
+
     with open(CONFIG_FILE, 'r') as f:
         for line in f:
+            line_num += 1
             line = line.strip()
-            if line and not line.startswith('#'):
+            if not line or line.startswith('#'):
+                continue
+
+            is_valid, error_msg = validate_target(line, line_num)
+            if is_valid:
                 targets.append(line)
+            else:
+                errors.append(f"  Line {line_num}: {error_msg} -> '{line}'")
+
+    if errors:
+        print(f"Error: Found {len(errors)} invalid entries in '{CONFIG_FILE}':")
+        for err in errors:
+            print(err)
+        sys.exit(1)
+
+    if not targets:
+        print(f"Warning: No backup targets found in '{CONFIG_FILE}'.")
+
     return targets
 
 def get_remote_details(target):
@@ -58,8 +117,8 @@ def get_remote_details(target):
                                     host_config['user'] = value
                                 elif key == 'port':
                                     host_config['port'] = value
-                except Exception:
-                    pass # Ignore config parsing errors
+                except Exception as e:
+                    print(f"Warning: Failed to parse SSH config for '{host_alias}': {e}")
         
         if '@' in remote_part:
             user, host_alias = remote_part.split('@', 1)
@@ -72,7 +131,8 @@ def get_remote_details(target):
         actual_port = int(host_config.get('port', 22))
         
         return actual_host, user, actual_port, path
-    except ValueError:
+    except ValueError as e:
+        print(f"Error: Invalid target format '{target}': {e}")
         return None, None, None, None
 
 
@@ -97,167 +157,6 @@ def backup_host_group(host, user, port, paths):
     print(f"Connecting to {user}@{host}:{port}")
     print(f"{'='*60}\n")
     
-    # Construct the tar command to run on the server
-    # We use 'tar cf - path1 path2 ...' to stream the tarball to stdout
-    # We use --ignore-failed-read to skip files we can't read (permission denied)
-    # We quote paths to handle spaces
-    
-    remote_paths = [p for _, p in paths]
-    quoted_paths = [shlex.quote(p) for p in remote_paths]
-    tar_cmd_str = f"tar cf - {' '.join(quoted_paths)} 2>/dev/null"
-    
-    ssh_cmd = [
-        "ssh",
-        "-p", str(port),
-        f"{user}@{host}",
-        tar_cmd_str
-    ]
-    
-    print(f"Downloading {len(remote_paths)} items in a single stream...")
-    
-    try:
-        # Run SSH and capture stdout (the tar stream)
-        # We use a large buffer size for performance
-        process = subprocess.Popen(ssh_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        
-        # Read the tar stream from stdout
-        # We use tarfile to extract on the fly
-        # But we need to map the extracted files to our desired destination structure
-        
-        # Our desired structure:
-        # ssh-backups/host_path_slug/contents
-        
-        # The tar stream contains paths relative to root (e.g., home/ubuntu/.ssh/authorized_keys)
-        # We need to intercept the extraction and redirect to the correct local folder
-        
-        # Since we can't easily "redirect" inside tarfile.extractall without extracting to a temp dir first,
-        # let's extract to a temp dir and then move.
-        # OR, we can iterate over members and extract them one by one to the right place.
-        
-        # Let's try iterating members from the stream
-        with tarfile.open(fileobj=process.stdout, mode="r|") as tar:
-            for member in tar:
-                # Find which target this member belongs to
-                # member.name is the path inside the tar (e.g. home/ubuntu/.ssh/id_rsa)
-                # We need to match it against our requested paths
-                
-                # Normalize member name (remove leading / if present, though tar usually removes it)
-                member_path = "/" + member.name.lstrip("/")
-                
-                # Find the best matching target path (longest prefix match)
-                best_match = None
-                best_match_len = -1
-                
-                for target, req_path in paths:
-                    # Check if member_path starts with req_path
-                    # Handle directory match: req_path=/home/ubuntu/scripts, member=/home/ubuntu/scripts/foo.sh
-                    # Handle file match: req_path=/home/ubuntu/.bashrc, member=/home/ubuntu/.bashrc
-                    
-                    # Ensure trailing slash for dir check to avoid partial name match
-                    req_dir = req_path if req_path.endswith('/') else req_path + '/'
-                    
-                    if member_path == req_path or member_path.startswith(req_dir):
-                        if len(req_path) > best_match_len:
-                            best_match = (target, req_path)
-                            best_match_len = len(req_path)
-                
-                if best_match:
-                    target_name, req_path = best_match
-                    
-                    # Determine destination
-                    # Dir: ssh-backups/host_path_slug/relative_part
-                    # File: ssh-backups/host_parent_slug/filename
-                    
-                    # We need to know if the requested path was a directory or file
-                    # But we don't know for sure without checking remote.
-                    # However, if the member path is longer than req_path, req_path was a dir.
-                    # If they are equal, it could be a file or a dir (but tar usually adds trailing slash for dirs? no)
-                    
-                    # Let's stick to the naming convention:
-                    # ssh-backups/host_path_slug
-                    
-                    slug = req_path.strip('/').replace('/', '_')
-                    if not slug: slug = "root"
-                    
-                    # If we treat everything as a "folder" in our backup structure:
-                    # /home/ubuntu/.bashrc -> ssh-backups/host_home_ubuntu_.bashrc/.bashrc ?
-                    # No, the user wanted:
-                    # /home/ubuntu/.bashrc -> ssh-backups/host_home_ubuntu/.bashrc
-                    # /home/ubuntu/scripts -> ssh-backups/host_home_ubuntu_scripts/script1.sh
-                    
-                    # Let's try to reconstruct the destination path
-                    
-                    # Logic:
-                    # 1. Calculate the relative path of the member from the requested path
-                    #    req=/a/b, member=/a/b/c -> rel=c
-                    #    req=/a/b, member=/a/b -> rel=""
-                    
-                    if member_path == req_path:
-                        rel_path = os.path.basename(req_path)
-                        # Parent of requested path
-                        parent_req = os.path.dirname(req_path)
-                        slug_base = parent_req.strip('/').replace('/', '_')
-                        dest_root = os.path.join(BACKUP_DIR, f"{host}_{slug_base}")
-                    else:
-                        # It's a file inside a requested directory
-                        rel_path = member_path[len(req_path):].lstrip('/')
-                        slug_base = req_path.strip('/').replace('/', '_')
-                        dest_root = os.path.join(BACKUP_DIR, f"{host}_{slug_base}")
-                        
-                        # If it was a directory request, we want the structure preserved
-                        # But wait, if I request /home/ubuntu/scripts
-                        # and get /home/ubuntu/scripts/foo.sh
-                        # I want ssh-backups/host_home_ubuntu_scripts/foo.sh
-                        
-                        # So:
-                        # dest_root = ssh-backups/host_home_ubuntu_scripts
-                        # final_path = dest_root / foo.sh
-                        
-                        # But what if I request a file /home/ubuntu/.bashrc?
-                        # member = /home/ubuntu/.bashrc
-                        # I want ssh-backups/host_home_ubuntu/.bashrc
-                        
-                        # Let's simplify:
-                        # If member matches req_path exactly, is it a file or dir?
-                        # If it's a file, we want it in host_parent_slug
-                        # If it's a dir, we want it in host_path_slug (and contents inside)
-                        
-                        # Since we are extracting a stream, we can just dump everything to a temp dir
-                        # and then move/organize. That might be safer and easier.
-                        pass
-
-        # Wait for process to finish
-        process.wait()
-        
-        if process.returncode != 0:
-            stderr = process.stderr.read().decode()
-            print(f"SSH Error: {stderr}")
-            return [(t, False) for t, _ in paths]
-            
-        print("✓ Stream received successfully. Organizing files...")
-        
-        # Re-run the extraction logic properly now that we know the stream works
-        # Actually, we consumed the stream above. We need to do it in one pass.
-        # Since the logic above was complex to do on-the-fly, let's use the "extract to temp" approach.
-        # But we can't seek on a pipe.
-        
-        # Let's restart the approach:
-        # 1. Stream tar to a temporary file (so we can seek/read multiple times if needed, or just extract)
-        # 2. Extract everything to a temp directory
-        # 3. Move files to their final destinations
-        
-    except Exception as e:
-        print(f"Error: {e}")
-        return [(t, False) for t, _ in paths]
-
-    return [] # Placeholder
-
-def backup_host_group_v2(host, user, port, paths):
-    """Backup all paths for a single host using a single SSH connection and tar stream"""
-    print(f"\n{'='*60}")
-    print(f"Connecting to {user}@{host}:{port}")
-    print(f"{'='*60}\n")
-    
     remote_paths = [p for _, p in paths]
     quoted_paths = [shlex.quote(p) for p in remote_paths]
     # Use -h to dereference symlinks (optional, but good for backups)
@@ -271,10 +170,7 @@ def backup_host_group_v2(host, user, port, paths):
     ]
     
     print(f"Downloading {len(remote_paths)} items in a single stream...")
-    
-    import tempfile
-    import shutil
-    
+
     # Create a temp directory to extract the full structure
     with tempfile.TemporaryDirectory() as temp_dir:
         try:
@@ -286,9 +182,20 @@ def backup_host_group_v2(host, user, port, paths):
             
             process = subprocess.Popen(ssh_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             
-            # Extract to temp_dir
+            # Extract to temp_dir with path traversal protection
             with tarfile.open(fileobj=process.stdout, mode="r|") as tar:
-                tar.extractall(path=temp_dir)
+                for member in tar:
+                    # Security: prevent path traversal attacks
+                    member_path = os.path.normpath(member.name)
+                    if member_path.startswith('..') or os.path.isabs(member_path):
+                        print(f"  ! Skipping suspicious path: {member.name}")
+                        continue
+                    # Verify the resolved path stays within temp_dir
+                    dest_path = os.path.realpath(os.path.join(temp_dir, member_path))
+                    if not dest_path.startswith(os.path.realpath(temp_dir)):
+                        print(f"  ! Skipping path escape attempt: {member.name}")
+                        continue
+                    tar.extract(member, path=temp_dir)
             
             process.wait()
             
@@ -359,7 +266,6 @@ def backup_host_group_v2(host, user, port, paths):
             
         except Exception as e:
             print(f"Error processing stream: {e}")
-            import traceback
             traceback.print_exc()
             return [(t, False) for t, _ in paths]
 
@@ -378,7 +284,7 @@ def main():
     
     # Process each host group
     for (host, user, port), paths in groups.items():
-        results = backup_host_group_v2(host, user, port, paths)
+        results = backup_host_group(host, user, port, paths)
         all_results.extend(results)
     
     # Summary
