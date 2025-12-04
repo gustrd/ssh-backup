@@ -6,7 +6,9 @@ A robust, cross-platform Python script designed to backup remote files and direc
 
 - **FIDO/Windows Hello Friendly**: Authenticates once per host, then streams all requested files in a single pass. No more tapping your key 50 times for 50 files.
 - **Cross-Platform**: Works seamlessly on Windows (using native OpenSSH) and Linux/macOS.
+- **Windows Remote Support**: Can backup files **from** remote Windows hosts (requires WSL on the remote).
 - **SSH Config Support**: Automatically resolves aliases, users, and ports from your `~/.ssh/config`.
+- **Sudo Support**: Can use `sudo` on the remote host to backup protected files.
 - **Smart Organization**: Preserves remote directory structures locally with clean, readable naming conventions.
 - **Zero Dependencies**: Uses standard system tools (`ssh`, `tar`) and Python standard library only.
 
@@ -21,6 +23,8 @@ A robust, cross-platform Python script designed to backup remote files and direc
 
 2. Ensure you have Python 3 installed.
 
+3. **For Remote Windows Hosts**: Ensure [WSL (Windows Subsystem for Linux)](https://learn.microsoft.com/en-us/windows/wsl/install) is installed and a default distribution is set up on the remote machine. The script uses WSL to perform the backup operation.
+
 
 ## Configuration
 
@@ -29,7 +33,7 @@ A robust, cross-platform Python script designed to backup remote files and direc
 
 **Format:**
 ```text
-[user@]host:/remote/path/to/file_or_folder
+[user@]host:/remote/path/to/file_or_folder [use_sudo]
 ```
 
 **Example:**
@@ -40,6 +44,14 @@ oracle-br:/home/ubuntu/scripts
 
 # Server 2 (explicit connection details)
 admin@192.168.1.50:/var/www/html
+
+# Server 3 (requires sudo for access)
+# Note: Requires passwordless sudo configuration on the remote host
+admin@secure-server:/etc/nginx/nginx.conf use_sudo
+
+# Server 4 (Windows Host)
+# Note: Path must be absolute Windows path
+admin@windows-server:C:\Users\Admin\Documents
 ```
 
 ## Usage
@@ -48,6 +60,13 @@ Run the script:
 
 ```bash
 python ssh_backup.py
+```
+
+**Options:**
+- `-n`, `--dry-run`: Show what would be backed up without actually downloading anything.
+
+```bash
+python ssh_backup.py --dry-run
 ```
 
 The script will:
@@ -74,6 +93,7 @@ Backups are saved in `ssh-backups/` with the following naming convention:
 
 - **"Permission denied"**: Ensure your SSH key is loaded (`ssh-add -l`) or that you have configured `~/.ssh/config` correctly.
 - **Windows Paths**: The script handles Windows paths automatically. Ensure you have the OpenSSH Client feature installed on Windows (Settings > Apps > Optional Features).
+- **Remote Windows Failures**: If backing up a Windows host fails, verify that you can run `ssh user@host "wsl --list"` successfully.
 
 ## License
 

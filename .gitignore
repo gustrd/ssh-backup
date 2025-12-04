@@ -1,6 +1,9 @@
 .ssh-backup_config.txt
 ssh-backups/
 
+.claude/
+.aiderignore 
+
 # Python
 __pycache__/
 *.py[cod]
